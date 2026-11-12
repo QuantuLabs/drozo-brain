@@ -1,0 +1,204 @@
+#![no_std]
+
+use pinocchio::error::ProgramError;
+use pinocchio::{
+    no_allocator, nostd_panic_handler, program_entrypoint, AccountView, Address, ProgramResult,
+};
+
+mod model_consts;
+mod v5;
+use model_consts::*;
+use model_consts::A as CA;
+
+program_entrypoint!(process_instruction);
+no_allocator!();
+nostd_panic_handler!();
+
+const MODEL_HEADER: usize = 120;
+const STATE_HEADER: usize = 32;
+const KINDS: usize = 5;
+const FIXED: u8 = 0;
+const HOT: u8 = 1;
+const REF: u8 = 2;
+const LAZY: u8 = 3;
+const OP_ADVANCE_UNTIL: u8 = 3;
+const OP_INIT: u8 = 4;
+const OP_MODEL_WRITE: u8 = 6;
+const OP_MODEL_SEAL: u8 = 7;
+const OP_NEXT_ACTION: u8 = 8;
+const OP_SET_DELEGATE: u8 = 11;
+const OP_SEAL: u8 = 12;
+const OP_STATE_CLOSE: u8 = 18;
+const OP_RECLAIM: u8 = 19;
+// Model account trailer after the M_IMAGE-byte image: magic + 1u32 once sealed.
+const SEALED: [u8; 8] = *b"SEAL\x01\x00\x00\x00";
+//@@ insert lib_tables
+
+// State header (little endian, 32 B): 0 magic "DVS4" | 4 version u16 | 6 K u16 | 8 tick u32 | 12 epoch u16
+// 14 kind u8 | 15 action u8 | 16 motion u8 | 17 phase u8 | 18 J u16 | 20 JS u16 | 22 SRC u16 | 24 E u32 | 28 H u16 | 30 reserved.
+const H_TICK: usize = 8;
+const H_EPOCH: usize = 12;
+const H_KIND: usize = 14;
+const H_ACTION: usize = 15;
+const H_MOTION: usize = 16;
+const H_PHASE: usize = 17;
+const H_J: usize = 18;
+const H_JS: usize = 20;
+const H_SRC: usize = 22;
+const H_E: usize = 24;
+const H_H: usize = 28;
+const H_RES: usize = 30;
+const NO_SEAL: u16 = 0xFFFF;
+const LAST_EPOCH: u16 = 0xFFFE;
+// Records: one sol_log_data slice, "drz1" | version u8 | type u8 | fly [32] | birth_slot u64 | epoch u16 [| ctl_seq u32].
+const REC_NEXT_ACTION: u8 = 1;
+const REC_SEAL: u8 = 2;
+const REC_INIT: u8 = 3;
+const REC_SET_DELEGATE: u8 = 4;
+const REC_CLOSE: u8 = 5;
+// `last` is stored relative to epoch_start - LAST_BIAS; saturating it at 0 is exact since
+// catch_up(n) == catch_up(min(n, CATCHUP_MAX_STEPS)).
+const LAST_BIAS: u32 = 1024;
+const _: () = assert!(LAST_BIAS > CATCHUP_MAX_STEPS && LAST_BIAS + TICKS + 1 < 1 << 11 && M_RUNS < 1 << 16);
+const _: () = assert!(K <= u16::MAX as usize);
+const _: () = assert!((u16::MAX as u64 + 1) * (TICKS as u64) < 1u64 << 31);
+const PHASE_IDLE: u8 = 0;
+const PHASE_A: u8 = 1;
+const PHASE_B: u8 = 2;
+const PHASE_DELIVER: u8 = 3;
+
+// CU weights: measured upper bounds (instrument build) + >= 20 % margin. ADVANCE_UNTIL spends a
+// client-chosen quota in these units; exactness never depends on them.
+// Extra per-item weight covering the instrument build's CU samples (0 in bench and production).
+const INSTR: i64 = if cfg!(feature = "instrument") { 400 } else { 0 };
+// Epoch-end decide_action + decide_motion.
+const W_DECIDE: i64 = @@W_DECIDE@@ + INSTR;
+
+// Instrument counters (feature `instrument`), u64 each, in the VM heap.
+const C_SPIKES: usize = 6;
+const C_EDGES: usize = 7;
+const C_COUPLED: usize = 8;
+const C_XONLY_STEPPED: usize = 9;
+const C_XONLY_JUMPED: usize = 10;
+const C_GTAIL: usize = 11;
+const C_CATCHUPS: usize = 17;
+const C_LAST_FAIL: usize = 26;
+
+/// Instrument counter `i` in the VM heap.
+#[cfg(any(feature = "instrument", feature = "profile"))]
+#[inline(always)]
+unsafe fn ctr(base: *mut u8, i: usize) -> *mut u64 {
+    let _ = base;
+    (v5::CTR_HEAP as usize + i * 8) as *mut u64
+}
+
+#[inline(always)]
+fn cnt(_base: *mut u8, _i: usize, _v: u64) {
+    #[cfg(any(feature = "instrument", feature = "profile"))]
+    unsafe {
+        let p = ctr(_base, _i);
+        p.write_unaligned(p.read_unaligned().wrapping_add(_v));
+    }
+}
+
+/// Remaining CU (instrument builds only; 0 otherwise).
+#[inline(always)]
+fn rem() -> i64 {
+    #[cfg(feature = "instrument")]
+    unsafe {
+        return pinocchio::syscalls::sol_remaining_compute_units() as i64;
+    }
+    #[cfg(not(feature = "instrument"))]
+    0
+}
+#[inline(always)]
+fn cmax(_base: *mut u8, _i: usize, _v: i64) {
+    #[cfg(feature = "instrument")]
+    unsafe {
+        let p = ctr(_base, _i);
+        if _v > 0 && _v as u64 > p.read_unaligned() {
+            p.write_unaligned(_v as u64);
+        }
+    }
+}
+#[inline(always)]
+fn cset(_base: *mut u8, _i: usize, _v: i64) {
+    #[cfg(feature = "instrument")]
+    unsafe {
+        ctr(_base, _i).write_unaligned(_v as u64);
+    }
+}
+
+#[inline(always)]
+fn invalid() -> ProgramError {
+    ProgramError::InvalidAccountData
+}
+#[inline(always)]
+fn bad_ix() -> ProgramError {
+    ProgramError::InvalidInstructionData
+}
+#[inline(always)]
+fn overflow() -> ProgramError {
+    ProgramError::Custom(1)
+}
+#[inline(always)]
+fn cert_violation() -> ProgramError {
+    ProgramError::Custom(2)
+}
+/// Stale control: birth_slot or expected_seq differs from the account, or an INIT grow/finish
+/// payload differs from the one its construction bound at step 0.
+#[inline(always)]
+fn stale() -> ProgramError {
+    ProgramError::Custom(3)
+}
+
+//@@ insert lib_core
+pub fn process_instruction(
+    program_id: &Address,
+    accounts: &[AccountView],
+    ix: &[u8],
+) -> ProgramResult {
+    if ix.is_empty() {
+        return Err(bad_ix());
+    }
+    v5::dispatch(program_id, accounts, ix)
+}
+
+/// Model upload: OP_MODEL_WRITE [6, offset u32, bytes] (signer) into the image, then OP_MODEL_SEAL
+/// [7] once the image hashes to MODEL_HASH. A sealed model is immutable.
+fn model_op(program_id: &Address, model: &AccountView, ix: &[u8]) -> ProgramResult {
+    if !model.owned_by(program_id) || !model.is_writable() {
+        return Err(invalid());
+    }
+    if ix[0] == OP_MODEL_WRITE && !model.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let mut data = model.try_borrow_mut()?;
+    if data.len() != M_TOTAL || data[M_IMAGE..] == SEALED {
+        return Err(invalid());
+    }
+    if ix[0] == OP_MODEL_WRITE {
+        let off = u32_at(ix, 1) as usize;
+        let bytes = &ix[5..];
+        if off + bytes.len() > M_IMAGE {
+            return Err(bad_ix());
+        }
+        data[off..off + bytes.len()].copy_from_slice(bytes);
+        return Ok(());
+    }
+    let mut hash = [0u8; 32];
+    let slice = [data.as_ptr() as u64, M_IMAGE as u64];
+    unsafe { pinocchio::syscalls::sol_sha256(slice.as_ptr() as *const u8, 1, hash.as_mut_ptr()) };
+    if hash != MODEL_HASH {
+        return Err(invalid());
+    }
+    data[M_IMAGE..].copy_from_slice(&SEALED);
+    Ok(())
+}
+#[inline(always)]
+fn log_slice(b: &[u8]) {
+    let s = [b.as_ptr() as u64, b.len() as u64];
+    unsafe { pinocchio::syscalls::sol_log_data(s.as_ptr() as *const u8, 1) };
+}
+
+

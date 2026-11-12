@@ -1,0 +1,615 @@
+//! Account version 5 (kernel V20a): dense layout, structural validation, canonical SEAL digest and
+//! the non-tick ops. Dispatched only on version 5 + exact length; never shares the V4 neuron body.
+
+use super::*;
+#[path = "body.rs"]
+mod body;
+use body::*;
+
+//@@ insert v5_layout
+// VM heap region (instrument counters only).
+const HEAP: u64 = 0x3_0000_0000;
+
+// Records version 3 (§4.3): "drz1" | 3 | type | fly 32 | birth_slot u64 | epoch u16 [| ctl_seq u32].
+const REC_V3: u8 = 3;
+const SEAL_REC_LEN: usize = 48 + 3 + 12 + RASTER_LEN + 32;
+const _: () = assert!(SEAL_REC_LEN == @@SEAL_REC_LEN:_@@);
+
+#[inline(always)]
+fn u64_at(b: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+}
+#[inline(always)]
+fn put_u32(b: &mut [u8], o: usize, v: u32) {
+    b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+/// All bytes zero (8-byte words, then the tail).
+#[inline(always)]
+fn zero(b: &[u8]) -> bool {
+    let w = b.chunks_exact(8);
+    w.remainder().iter().all(|&x| x == 0) && w.into_iter().all(|x| u64::from_le_bytes(x.try_into().unwrap()) == 0)
+}
+#[inline(always)]
+fn key(b: &[u8], o: usize) -> [u8; 32] {
+    b[o..o + 32].try_into().unwrap()
+}
+
+/// Exact version 5 by version field and length (magic alone never dispatches).
+#[inline(always)]
+pub fn is_v5(d: &[u8]) -> bool {
+    d.len() == V5_LEN && &d[0..4] == b"DVS4" && u16_at(d, 4) == VERSION_V5 && u16_at(d, 6) as usize == K
+}
+
+/// Routes the model ops, INIT and CLOSE (fly or construction), then the ops on an initialized fly
+/// (fly at `accounts[1]` for ADVANCE, else `accounts[0]`).
+pub fn dispatch(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> ProgramResult {
+    let (n, l) = (accounts.len(), ix.len());
+    let shape = match ix[0] {
+        OP_MODEL_WRITE | OP_MAP_WRITE => n == 1 && l >= 5,
+        OP_MODEL_SEAL | OP_MAP_SEAL => n == 1 && l == 1,
+        OP_INIT => n == 6 && l == 74,
+        OP_NEXT_ACTION => n == 7 && l == 24,
+        OP_ADVANCE_UNTIL => n == 2 && l == 9,
+        OP_SEAL => n == 1 && l == 3,
+        OP_BODY => n == 3 && l == 5,
+        OP_SET_DELEGATE => n == 3 && l == 53,
+        OP_STATE_CLOSE => n == 4 && l == 13,
+        OP_RECLAIM => l == 2 && ((ix[1] == 0 && n == 4) || (ix[1] == 1 && n == 2)),
+        _ => false,
+    };
+    if !shape {
+        return Err(bad_ix());
+    }
+    match ix[0] {
+        OP_MODEL_WRITE | OP_MODEL_SEAL => return model_op(program_id, &accounts[0], ix),
+        OP_MAP_WRITE | OP_MAP_SEAL => return map_op(program_id, &accounts[0], ix),
+        OP_BODY => return body_op(program_id, accounts, ix),
+        OP_INIT => return init(program_id, accounts, ix),
+        OP_STATE_CLOSE => return close(program_id, accounts, ix),
+        OP_RECLAIM => return reclaim(program_id, accounts, ix),
+        _ => {}
+    }
+    let acc = accounts.get((ix[0] == OP_ADVANCE_UNTIL) as usize).ok_or_else(bad_ix)?;
+    if !acc.owned_by(program_id) || !acc.is_writable() {
+        return Err(invalid());
+    }
+    let mut d = acc.try_borrow_mut()?;
+    check_header(&d)?;
+    match ix[0] {
+        OP_ADVANCE_UNTIL => advance_op(program_id, accounts, &mut d, ix),
+        OP_SEAL => {
+            if u16_at(ix, 1) != u16_at(&d, H_EPOCH) {
+                return Err(bad_ix());
+            }
+            if d[H_PHASE] != PHASE_IDLE || u32_at(&d, H_TICK) != (u16_at(&d, H_EPOCH) as u32 + 1) * TICKS {
+                return Err(invalid());
+            }
+            seal(&mut d, acc.address())
+        }
+        OP_NEXT_ACTION => next_action(accounts, &mut d, ix),
+        OP_SET_DELEGATE => set_delegate(accounts, &mut d, ix),
+        _ => Err(bad_ix()),
+    }
+}
+
+//@@ insert v5_validators
+/// Version-3 record header (+ ctl_seq for controls) then `payload`.
+#[inline(never)]
+fn emit3(ty: u8, fly: &Address, birth: &[u8], epoch: u16, seq: u32, payload: &[u8]) {
+    let mut b = [0u8; 52 + 201];
+    b[0..4].copy_from_slice(b"drz1");
+    b[4] = REC_V3;
+    b[5] = ty;
+    b[6..38].copy_from_slice(fly.as_array());
+    b[38..46].copy_from_slice(birth);
+    b[46..48].copy_from_slice(&epoch.to_le_bytes());
+    b[48..52].copy_from_slice(&seq.to_le_bytes());
+    let n = 52 + payload.len();
+    b[52..n].copy_from_slice(payload);
+    log_slice(&b[..n]);
+}
+
+/// Version-3 SEAL record: kind, action, motion, totals, packed raster, digest.
+#[inline(never)]
+fn seal_record(d: &[u8], fly: &Address) {
+    let mut b = [0u8; SEAL_REC_LEN];
+    b[0..4].copy_from_slice(b"drz1");
+    b[4] = REC_V3;
+    b[5] = REC_SEAL;
+    b[6..38].copy_from_slice(fly.as_array());
+    b[38..46].copy_from_slice(&d[T5_BIRTH..T5_NAME_LEN]);
+    b[46..48].copy_from_slice(&d[H_EPOCH..H_EPOCH + 2]);
+    b[48] = d[H_KIND];
+    b[49] = d[H_ACTION];
+    b[50] = d[H_MOTION];
+    b[51..SEAL_REC_LEN - 32].copy_from_slice(&d[O_TOTALS..O_TR]);
+    let mut h = [0u8; 32];
+    digest(d, &mut h);
+    b[SEAL_REC_LEN - 32..].copy_from_slice(&h);
+    log_slice(&b);
+}
+
+/// SEAL of a terminal IDLE image (explicit or inside ADVANCE): IDLE validation, record, and
+/// sealed_epoch on the first call; a repeat re-emits the same bytes.
+fn seal(d: &mut [u8], fly: &Address) -> ProgramResult {
+    check_idle(d)?;
+    seal_record(d, fly);
+    let epoch = u16_at(d, H_EPOCH);
+    if u16_at(d, T5_SEALED) != epoch {
+        d[T5_SEALED..T5_SEQ].copy_from_slice(&epoch.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// ctl_seq += 1 (checked, unaligned LE); returns the new value.
+#[inline(always)]
+fn bump(d: &mut [u8]) -> Result<u32, ProgramError> {
+    let v = u32_at(d, T5_SEQ).checked_add(1).ok_or_else(overflow)?;
+    put_u32(d, T5_SEQ, v);
+    Ok(v)
+}
+
+const SYSTEM: [u8; 32] = [0; 32];
+/// Fee-shares program, its pool config ["cfg", admin0, id], the shards ["vault", config, [i]] receiving the fee
+/// (selected by fly[0] & 7), FEE_CAP (= the pool's fee_max) and the RECLAIM kind-0 targets (our model and stock map).
+// BEGIN tools/fee_vaults.py (profile devnet): generated, do not edit
+const FEE_PROGRAM: [u8; 32] = [177, 68, 243, 67, 115, 133, 0, 245, 142, 84, 3, 243, 126, 103, 159, 30, 148, 129, 16, 248, 165, 235, 205, 116, 42, 182, 134, 49, 230, 53, 242, 122];
+const FEE_CONFIG: [u8; 32] = [226, 30, 120, 6, 100, 247, 10, 172, 47, 46, 119, 174, 43, 64, 161, 16, 107, 254, 215, 225, 253, 109, 169, 218, 165, 139, 57, 230, 36, 230, 55, 103];
+const FEE_CAP: u64 = 20_000_000;
+const FEE_VAULTS: [[u8; 32]; 8] = [
+    [97, 12, 243, 70, 156, 97, 218, 119, 12, 144, 4, 170, 144, 153, 14, 93, 51, 234, 96, 57, 158, 13, 39, 115, 10, 218, 76, 191, 222, 149, 151, 205],
+    [201, 88, 207, 196, 133, 254, 246, 213, 244, 30, 170, 17, 122, 206, 100, 233, 221, 25, 0, 153, 225, 211, 241, 145, 207, 171, 188, 62, 140, 189, 192, 67],
+    [142, 135, 27, 100, 209, 100, 95, 95, 131, 139, 252, 60, 188, 80, 119, 92, 20, 161, 140, 204, 185, 20, 137, 140, 157, 44, 83, 229, 198, 240, 161, 118],
+    [29, 16, 47, 38, 72, 24, 30, 37, 158, 173, 140, 29, 128, 145, 117, 6, 56, 105, 25, 184, 69, 247, 235, 83, 170, 128, 169, 4, 102, 102, 170, 197],
+    [75, 137, 187, 116, 55, 30, 17, 14, 141, 66, 107, 7, 135, 135, 130, 228, 109, 105, 41, 69, 150, 133, 206, 201, 212, 188, 177, 38, 104, 62, 87, 105],
+    [100, 5, 113, 190, 59, 185, 187, 116, 63, 114, 220, 83, 146, 36, 170, 28, 217, 35, 184, 15, 102, 243, 193, 17, 165, 245, 251, 17, 168, 211, 170, 108],
+    [124, 193, 50, 237, 72, 81, 14, 83, 185, 69, 221, 98, 62, 112, 159, 95, 246, 219, 121, 61, 248, 248, 235, 224, 137, 237, 192, 221, 41, 93, 57, 157],
+    [104, 216, 90, 151, 0, 174, 31, 69, 125, 35, 121, 170, 252, 63, 181, 2, 24, 153, 15, 64, 246, 51, 189, 203, 37, 216, 152, 177, 76, 200, 37, 212],
+];
+const MODEL_KEY: [u8; 32] = [102, 235, 85, 164, 88, 125, 145, 173, 117, 93, 4, 40, 213, 166, 35, 26, 252, 195, 94, 207, 159, 122, 60, 226, 133, 246, 204, 192, 201, 186, 253, 71];
+const MAP_KEY: [u8; 32] = [13, 89, 129, 194, 207, 144, 169, 112, 157, 51, 151, 217, 215, 148, 196, 110, 189, 129, 153, 102, 75, 104, 215, 29, 168, 120, 89, 218, 225, 198, 26, 217];
+// END tools/fee_vaults.py
+const _: () = {
+    let mut i = 0;
+    while i < 8 {
+        let mut z = true;
+        let mut b = 0;
+        while b < 32 {
+            z &= FEE_VAULTS[i][b] == 0;
+            b += 1;
+        }
+        assert!(!z);
+        let mut j = i + 1;
+        while j < 8 {
+            let mut eq = true;
+            b = 0;
+            while b < 32 {
+                eq &= FEE_VAULTS[i][b] == FEE_VAULTS[j][b];
+                b += 1;
+            }
+            assert!(!eq);
+            j += 1;
+        }
+        i += 1;
+    }
+};
+#[inline(always)]
+fn fee_unpaid() -> ProgramError {
+    ProgramError::Custom(6)
+}
+#[inline(always)]
+fn nothing_to_reclaim() -> ProgramError {
+    ProgramError::Custom(7)
+}
+#[inline(always)]
+fn fee_above_max() -> ProgramError {
+    ProgramError::Custom(8)
+}
+
+#[inline(always)]
+fn slot() -> Result<u64, ProgramError> {
+    use pinocchio::sysvars::{clock::Clock, Sysvar};
+    Ok(Clock::get()?.slot)
+}
+
+/// A signed control's (birth_slot, expected_seq) at `ix[o..o + 12]` must equal the account's (§5.5).
+#[inline(always)]
+fn current(d: &[u8], ix: &[u8], o: usize) -> ProgramResult {
+    if ix[o..o + 8] != d[T5_BIRTH..T5_NAME_LEN] || ix[o + 8..o + 12] != d[T5_SEQ..T5_BIRTH] {
+        return Err(stale());
+    }
+    Ok(())
+}
+
+/// The signer signed and is the fly's rent payer `owner`.
+fn owner_signed(signer: &AccountView, owner: [u8; 32]) -> Result<[u8; 32], ProgramError> {
+    if !signer.is_signer() || *signer.address().as_array() != owner {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    Ok(owner)
+}
+
+/// ADVANCE [3, until u16, quota u32, epoch u16] (model ro, fly w).
+fn advance_op(program_id: &Address, accounts: &[AccountView], d: &mut [u8], ix: &[u8]) -> ProgramResult {
+    let model_account = &accounts[0];
+    if !model_account.owned_by(program_id) || model_account.is_writable() {
+        return Err(invalid());
+    }
+    let model_data = model_account.try_borrow()?;
+    let model = Model::parse(&model_data)?;
+    let epoch = u16_at(d, H_EPOCH);
+    let lt = u32_at(d, H_TICK) - epoch as u32 * TICKS;
+    let terminal = d[H_PHASE] == PHASE_IDLE && lt == TICKS;
+    if u16_at(ix, 7) != epoch {
+        return Err(bad_ix());
+    }
+    let until = u16_at(ix, 1) as u32;
+    let sealed = u16_at(d, T5_SEALED) == epoch;
+    // At terminal only the seal-only case (unsealed, until = 400) is accepted.
+    if until > TICKS || (until <= lt && !(terminal && until == TICKS && !sealed)) {
+        return Err(bad_ix());
+    }
+    let r0 = rem();
+    let quota = u32_at(ix, 3) as i64;
+    let mut budget = Budget { left: quota, base: d.as_mut_ptr() };
+    unsafe { advance(&model, d.as_mut_ptr(), until, &mut budget)? };
+    // SEAL unit (§6.3): at terminal IDLE and unsealed, when the quota left covers W_SEAL.
+    if !sealed && d[H_PHASE] == PHASE_IDLE && u32_at(d, H_TICK) == (epoch as u32 + 1) * TICKS && budget.ensure(W5_SEAL) {
+        let t0 = rem();
+        seal(d, accounts[1].address())?;
+        spend(&mut budget, W5_SEAL);
+        nu(1);
+        cmax(d.as_mut_ptr(), C5_SEAL, t0 - rem());
+    }
+    cmax(d.as_mut_ptr(), C5_UNRESERVED, r0 - rem() - (quota - budget.left));
+    #[cfg(any(feature = "instrument", feature = "profile"))]
+    unsafe {
+        log_slice(core::slice::from_raw_parts(CTR_HEAP as *const u8, CTR5_N * 8))
+    };
+    #[cfg(feature = "sidecar")]
+    {
+        let mut s = [0u8; 16];
+        s[..8].copy_from_slice(&unsafe { *(UNITS_HEAP as *const u64) }.to_le_bytes());
+        s[8..].copy_from_slice(&((quota - budget.left) as u64).to_le_bytes());
+        log_slice(&s);
+    }
+    Ok(())
+}
+
+/// NEXT_ACTION [8, kind, next_epoch u16, birth_slot u64, expected_seq u32, max_fee u64] (fly w, authority s,
+/// asset unread, payer ws, fee vault w, System ro, fee config ro): the rent payer or its valid delegate; the payer
+/// pays the config's fee, at most max_fee; the writes do not depend on the path.
+fn next_action(accounts: &[AccountView], d: &mut [u8], ix: &[u8]) -> ProgramResult {
+    if ix[1] == 0 || ix[1] as usize > KINDS {
+        return Err(bad_ix());
+    }
+    current(d, ix, 4)?;
+    let epoch = u16_at(d, H_EPOCH);
+    if d[H_PHASE] != PHASE_IDLE || u32_at(d, H_TICK) != (epoch as u32 + 1) * TICKS {
+        return Err(invalid());
+    }
+    let signer = &accounts[1];
+    let mut flag = 0u8;
+    let owner = key(d, T5_RENT_PAYER);
+    if !signer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if *signer.address().as_array() != owner {
+        let delegate = key(d, T5_DELEGATE);
+        if delegate == [0u8; 32]
+            || *signer.address().as_array() != delegate
+            || key(d, T5_GRANTER) != owner
+            || slot()? > u64_at(d, T5_EXPIRY)
+        {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        flag = 1;
+    }
+    let next = epoch.checked_add(1).ok_or_else(invalid)?;
+    if u16_at(ix, 2) != next {
+        return Err(bad_ix());
+    }
+    if u16_at(d, T5_SEALED) != epoch || epoch >= LAST_EPOCH {
+        return Err(invalid());
+    }
+    bodied(d, epoch)?;
+    pay_fee(accounts, u64_at(ix, 16))?;
+    // last <- last.saturating_sub(400) on bits 5-15 of four ctl lanes per word (lane >= 0x8000 - 400: no borrow).
+    const L: u64 = 0x0001_0001_0001_0001;
+    let c = unsafe { d.as_mut_ptr().add(O_CTL) } as *mut u64;
+    for i in 0..2 * K / 8 {
+        unsafe {
+            let w = *c.add(i);
+            let t = ((w >> 5 & 0x07FF * L) | 0x8000 * L) - TICKS as u64 * L;
+            *c.add(i) = w & 0x1F * L | (t & 0x07FF * L & (t >> 15 & L) * 0xFFFF) << 5;
+        }
+    }
+    for l in d[O_CTL + 2 * K / 8 * 8..O_INP_BITS].chunks_exact_mut(2) {
+        let v = u16::from_le_bytes([l[0], l[1]]);
+        let v = (v >> 5).saturating_sub(TICKS as u16) << 5 | v & 0x1F;
+        l.copy_from_slice(&v.to_le_bytes());
+    }
+    d[O_TOTALS..O_TR].fill(0);
+    d[H_ACTION] = 0;
+    d[H_MOTION] = 0;
+    d[H_EPOCH..H_EPOCH + 2].copy_from_slice(&next.to_le_bytes());
+    d[H_KIND] = ix[1];
+    let seq = bump(d)?;
+    let mut p = [0u8; 34];
+    p[0] = ix[1];
+    p[1..33].copy_from_slice(signer.address().as_array());
+    p[33] = flag;
+    emit3(REC_NEXT_ACTION, accounts[0].address(), &d[T5_BIRTH..T5_NAME_LEN], next, seq, &p);
+    Ok(())
+}
+
+/// The pool config (key and role checked by the caller): owner FEE_PROGRAM, 152 B, "STF1", version 1; returns
+/// (admin, fee).
+fn fee_config(config: &AccountView) -> Result<([u8; 32], u64), ProgramError> {
+    if !config.owned_by(&Address::new_from_array(FEE_PROGRAM)) {
+        return Err(invalid());
+    }
+    let c = config.try_borrow()?;
+    if c.len() != 152 || &c[0..4] != b"STF1" || c[4] != 1 {
+        return Err(invalid());
+    }
+    Ok((key(&c, 40), u64_at(&c, 136)))
+}
+
+/// The config's fee (<= FEE_CAP, <= max_fee) from the payer signer to the fly's shard by System transfer.
+fn pay_fee(accounts: &[AccountView], max_fee: u64) -> ProgramResult {
+    let [fly, _, _, payer, vault, system, config] = accounts else {
+        return Err(bad_ix());
+    };
+    if *vault.address().as_array() != FEE_VAULTS[(fly.address().as_array()[0] & 7) as usize]
+        || *system.address().as_array() != SYSTEM
+        || system.is_writable()
+        || !vault.is_writable()
+        || !payer.is_writable()
+        || *config.address().as_array() != FEE_CONFIG
+        || config.is_writable()
+    {
+        return Err(invalid());
+    }
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let (_, fee) = fee_config(config)?;
+    if !vault.owned_by(&Address::new_from_array(FEE_PROGRAM)) || fee > FEE_CAP {
+        return Err(invalid());
+    }
+    if fee > max_fee {
+        return Err(fee_above_max());
+    }
+    if fee == 0 {
+        return Ok(());
+    }
+    if payer.lamports() < fee {
+        return Err(fee_unpaid());
+    }
+    pinocchio_system::instructions::Transfer { from: payer, to: vault, lamports: fee }.invoke()
+}
+
+/// RECLAIM [19, kind] (§9.3): the lamports above the rent minimum of a kernel account to `dest`; data, owner and
+/// length untouched, no record. Kind 0 (target w, dest w, admin s, fee config ro): MODEL_KEY or MAP_KEY, signed by
+/// the pool admin. Kind 1 (fly w, rent payer w): a fly, by anyone, to its recorded rent payer.
+fn reclaim(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> ProgramResult {
+    let (target, dest) = (&accounts[0], &accounts[1]);
+    if ix[1] == 1 {
+        if !target.owned_by(program_id) || !target.is_writable() {
+            return Err(invalid());
+        }
+        let d = target.try_borrow()?;
+        check_header(&d)?;
+        if !dest.is_writable() || target.address() == dest.address() || key(&d, T5_RENT_PAYER) != *dest.address().as_array() {
+            return Err(invalid());
+        }
+    } else {
+        let (admin, config) = (&accounts[2], &accounts[3]);
+        let t = target.address().as_array();
+        if (*t != MODEL_KEY && *t != MAP_KEY)
+            || !target.owned_by(program_id)
+            || !target.is_writable()
+            || !dest.is_writable()
+            || target.address() == dest.address()
+            || dest.address() == config.address()
+            || *config.address().as_array() != FEE_CONFIG
+            || config.is_writable()
+        {
+            return Err(invalid());
+        }
+        let (a, _) = fee_config(config)?;
+        if !admin.is_signer() || *admin.address().as_array() != a {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+    }
+    use pinocchio::sysvars::{rent::Rent, Sysvar};
+    let l = target.lamports();
+    let x = l.saturating_sub(Rent::get()?.try_minimum_balance(target.data_len())?);
+    if x == 0 {
+        return Err(nothing_to_reclaim());
+    }
+    dest.set_lamports(dest.lamports().checked_add(x).ok_or_else(invalid)?);
+    target.set_lamports(l - x);
+    Ok(())
+}
+
+/// INIT [4, name_len, name 32, delegate 32, expiry u64] (fly w = PDA ["fly", asset], owner s,
+/// asset ro, payer ws, System program ro, map ro), in three steps selected by the fly length (§5.2).
+fn init(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> ProgramResult {
+    let (fly, owner, asset, payer, system, map) = (&accounts[0], &accounts[1], &accounts[2], &accounts[3], &accounts[4], &accounts[5]);
+    let pl = &ix[1..74];
+    let agent = *asset.address().as_array();
+    let pk = *payer.address().as_array();
+    let fk = *fly.address().as_array();
+    let mk = map.address().as_array();
+    if pk == agent || pk == fk || fk == agent || *system.address().as_array() != SYSTEM || system.is_writable() || map.is_writable() {
+        return Err(invalid());
+    }
+    if !payer.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if !fly.is_writable() || !payer.is_writable() {
+        return Err(invalid());
+    }
+    if fly.owned_by(&Address::new_from_array(SYSTEM)) && fly.data_len() == 0 {
+        owner_signed(owner, pk)?;
+        let (pda, bump) = Address::find_program_address(&[b"fly", &agent], program_id);
+        if pda != *fly.address() {
+            return Err(invalid());
+        }
+        sealed_map(program_id, map)?;
+        let now = slot()?;
+        let n = pl[0] as usize;
+        let name = &pl[1..1 + n.min(32)];
+        let expiry = u64_at(pl, 65);
+        if n == 0
+            || n > 32
+            || !zero(&pl[1 + n..33])
+            || core::str::from_utf8(name).is_err()
+            || name.iter().any(|&b| b < 0x20 || b == 0x7F)
+            || (if pl[33..65] == [0u8; 32] { expiry != 0 } else { expiry > now.checked_add(MAX_DELEGATE_SLOTS).ok_or_else(overflow)? })
+        {
+            return Err(bad_ix());
+        }
+        use pinocchio::cpi::{Seed, Signer};
+        use pinocchio::sysvars::{rent::Rent, Sysvar};
+        use pinocchio_system::instructions::{Allocate, Assign, CreateAccount, Transfer};
+        let rent = Rent::get()?.try_minimum_balance(V5_LEN)?;
+        let b = [bump];
+        let seeds = [Seed::from(b"fly"), Seed::from(&agent), Seed::from(&b)];
+        let s = [Signer::from(&seeds)];
+        if fly.lamports() == 0 {
+            CreateAccount { from: payer, to: fly, lamports: rent, space: STEP as u64, owner: program_id }.invoke_signed(&s)?;
+        } else {
+            let top = rent.saturating_sub(fly.lamports());
+            if top != 0 {
+                Transfer { from: payer, to: fly, lamports: top }.invoke()?;
+            }
+            Allocate { account: fly, space: STEP as u64 }.invoke_signed(&s)?;
+            Assign { account: fly, owner: program_id }.invoke_signed(&s)?;
+        }
+        let mut d = fly.try_borrow_mut()?;
+        d[C_PAYER..C_ASSET].copy_from_slice(payer.address().as_array());
+        d[C_ASSET..C_BIRTH].copy_from_slice(&agent);
+        d[C_BIRTH..C_PAYLOAD].copy_from_slice(&now.to_le_bytes());
+        d[C_PAYLOAD..C_MAP].copy_from_slice(pl);
+        d[C_MAP..C_END].copy_from_slice(mk);
+        return Ok(());
+    }
+    let len = fly.data_len();
+    if !fly.owned_by(program_id) || (len != STEP && len != 2 * STEP) {
+        return Err(invalid());
+    }
+    let creator = {
+        let d = fly.try_borrow()?;
+        if key(&d, C_ASSET) != agent || key(&d, C_PAYER) != *payer.address().as_array() {
+            return Err(invalid());
+        }
+        let creator = owner_signed(owner, key(&d, C_PAYER))?;
+        if d[C_PAYLOAD..C_MAP] != *pl || d[C_MAP..C_END] != *mk {
+            return Err(stale());
+        }
+        creator
+    };
+    if len == STEP {
+        return fly.resize(2 * STEP);
+    }
+    fly.resize(V5_LEN)?;
+    let mut d = fly.try_borrow_mut()?;
+    if !zero(&d[C_END..]) {
+        return Err(invalid());
+    }
+    let birth: [u8; 8] = d[C_BIRTH..C_PAYLOAD].try_into().unwrap();
+    d[..C_END].fill(0);
+    d[0..4].copy_from_slice(b"DVS4");
+    d[4..6].copy_from_slice(&VERSION_V5.to_le_bytes());
+    d[6..8].copy_from_slice(&(K as u16).to_le_bytes());
+    d[H_KIND] = 1;
+    d[T5_AGENT..T5_RENT_PAYER].copy_from_slice(&agent);
+    d[T5_RENT_PAYER..T5_DELEGATE].copy_from_slice(payer.address().as_array());
+    d[T5_DELEGATE..T5_GRANTER].copy_from_slice(&pl[33..65]);
+    if pl[33..65] != [0u8; 32] {
+        d[T5_GRANTER..T5_EXPIRY].copy_from_slice(&creator);
+    }
+    d[T5_EXPIRY..T5_SEALED].copy_from_slice(&pl[65..73]);
+    d[T5_SEALED..T5_SEQ].copy_from_slice(&NO_SEAL.to_le_bytes());
+    put_u32(&mut d, T5_SEQ, 1);
+    d[T5_BIRTH..T5_NAME_LEN].copy_from_slice(&birth);
+    d[T5_NAME_LEN..T5_RESERVED].copy_from_slice(&pl[..33]);
+    init_block(&mut d, mk);
+    let mut p = [0u8; 201];
+    p[..32].copy_from_slice(&agent);
+    p[32..64].copy_from_slice(&creator);
+    p[64..96].copy_from_slice(payer.address().as_array());
+    p[96..169].copy_from_slice(pl);
+    p[169..].copy_from_slice(mk);
+    emit3(REC_INIT, fly.address(), &birth, 0, 1, &p);
+    Ok(())
+}
+
+/// SET_DELEGATE [11, delegate 32, expiry u64, birth_slot u64, expected_seq u32] (fly w, rent payer
+/// signer, asset unread), any phase; delegate 0 with expiry 0 revokes.
+fn set_delegate(accounts: &[AccountView], d: &mut [u8], ix: &[u8]) -> ProgramResult {
+    if accounts.len() != 3 || ix.len() != 53 {
+        return Err(bad_ix());
+    }
+    current(d, ix, 41)?;
+    let granter = owner_signed(&accounts[1], key(d, T5_RENT_PAYER))?;
+    let expiry = u64_at(ix, 33);
+    let revoke = ix[1..33] == [0u8; 32];
+    if if revoke { expiry != 0 } else { expiry > slot()?.checked_add(MAX_DELEGATE_SLOTS).ok_or_else(overflow)? } {
+        return Err(bad_ix());
+    }
+    d[T5_DELEGATE..T5_GRANTER].copy_from_slice(&ix[1..33]);
+    d[T5_GRANTER..T5_EXPIRY].copy_from_slice(if revoke { &SYSTEM } else { &granter });
+    d[T5_EXPIRY..T5_SEALED].copy_from_slice(&ix[33..41]);
+    let seq = bump(d)?;
+    emit3(REC_SET_DELEGATE, accounts[0].address(), &d[T5_BIRTH..T5_NAME_LEN], u16_at(d, H_EPOCH), seq, &d[T5_DELEGATE..T5_SEALED]);
+    Ok(())
+}
+
+/// Moves all lamports to `dest`, zeroes the data and closes the account.
+fn finish_close(acc: &AccountView, dest: &AccountView) -> ProgramResult {
+    let l = acc.lamports();
+    dest.set_lamports(dest.lamports().checked_add(l).ok_or_else(invalid)?);
+    acc.set_lamports(0);
+    acc.try_borrow_mut()?.fill(0);
+    acc.close()
+}
+
+/// CLOSE [18, birth_slot u64, expected_seq u32] (fly w, rent payer s, destination w, asset unread). Fly or
+/// construction (expected_seq 0, no record); every lamport to the rent payer; Clock.slot > birth_slot.
+fn close(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> ProgramResult {
+    let (acc, dest) = (&accounts[0], &accounts[2]);
+    if !acc.owned_by(program_id) || !acc.is_writable() || !dest.is_writable() || acc.address() == dest.address() {
+        return Err(invalid());
+    }
+    {
+        let mut d = acc.try_borrow_mut()?;
+        let fly = d.len() == V5_LEN;
+        if fly {
+            check_header(&d)?;
+        } else if d.len() != STEP && d.len() != 2 * STEP {
+            return Err(invalid());
+        }
+        let (birth, payer) = if fly { (T5_BIRTH, T5_RENT_PAYER) } else { (C_BIRTH, C_PAYER) };
+        owner_signed(&accounts[1], key(&d, payer))?;
+        let seq = if fly { u32_at(&d, T5_SEQ) } else { 0 };
+        if ix[1..9] != d[birth..birth + 8] || u32_at(ix, 9) != seq {
+            return Err(stale());
+        }
+        if slot()? <= u64_at(&d, birth) || key(&d, payer) != *dest.address().as_array() {
+            return Err(invalid());
+        }
+        if fly {
+            let seq = bump(&mut d)?;
+            let mut p = [0u8; 33];
+            p[..32].copy_from_slice(dest.address().as_array());
+            emit3(REC_CLOSE, acc.address(), &d[T5_BIRTH..T5_NAME_LEN], u16_at(&d, H_EPOCH), seq, &p);
+        }
+    }
+    finish_close(acc, dest)
+}
+
+//@@ insert v5_engine

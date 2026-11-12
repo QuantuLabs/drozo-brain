@@ -1,0 +1,24 @@
+[package]
+name = "drozo-exact-core-v21"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+instrument = []
+profile = []
+sidecar = []
+bench = []
+
+[dependencies]
+pinocchio = { version = "=0.10.2", features = ["cpi"] }
+pinocchio-system = "=0.5.0"
+drozo-body = { path = "../body" }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"
