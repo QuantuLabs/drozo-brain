@@ -1,0 +1,18 @@
+{
+  "crate_metadata": {
+    "five8_core@1.0.0": "80ccc469ece5268f",
+    "solana_program_error@3.0.1": "dbf46558e02a4ee9",
+    "solana_define_syscall@5.2.0": "3af44e6ac36a6095",
+    "solana_define_syscall@4.0.1": "e8fdd6ef4402feb2",
+    "drozo_body@0.1.0": "55c14b517af542bd",
+    "five8@1.0.0": "647ed873c9924022",
+    "five8_const@1.0.0": "04865a3454e8614a",
+    "solana_address@2.6.1": "3491607ac1f3da81",
+    "solana_account_view@1.0.0": "75e08bbcd8aa9e6b",
+    "solana_instruction_view@1.0.0": "0cb36c3f6a8f9a4c",
+    "pinocchio@0.10.2": "322488b040949260",
+    "pinocchio_system@0.5.0": "6c7421ebc59573e3",
+    "drozo_exact_core_v21@0.1.0": "85dcc62fcd0e55bb"
+  },
+  "registry_prefix": "/Users/true/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f"
+}
