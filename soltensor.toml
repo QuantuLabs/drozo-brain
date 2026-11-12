@@ -1,0 +1,11 @@
+schema = 1
+
+[model]
+path = "drozo.py"
+format = "dsl"
+
+[network]
+cluster = "localnet"
+
+[build]
+output = "target/drozo.so"
