@@ -26,10 +26,36 @@ edge_delta = R16(src_sign * edge_syn * w_syn_q16 * gain_q16)
 R16(v) = v / 2^16, rounded half away from zero
 ```
 
-## Status
+## Build
 
-This repo will hold the SolTensor version of the model: its definition in the SolTensor format, the data it compiles from, a reference simulator and parity tests. That is the version that will be published.
+With [SolTensor](https://github.com/QuantuLabs/soltensor) installed (its README lists the Solana
+tools: `cargo-build-sbf` 4.1.0 and platform-tools v1.54):
 
-It lands here once `soltensor build` compiles it into a program that matches the program Drozo runs today, byte for byte.
+```bash
+soltensor analyze      # sizes and host checks
+soltensor build        # target/drozo.so and target/drozo.model.bin
+soltensor test         # host reference on the 5 recorded cases
+shasum -a 256 target/drozo.so
+# a98f6b207946e39b54972a5228590f50ccc911a070d09e411a8e1c53367df65d  target/drozo.so
+```
+
+`build` produces the program Drozo runs on devnet, byte for byte (115,344 bytes, SBPF v0), and
+refuses anything else. It needs no wallet, validator or network. The whole inference runs on-chain:
+SolTensor only prepares the model image, the certificate tables, the constants and the Rust brain
+code. Deploying the program and driving flies belongs to the Drozo app.
+
+The identical binary was checked from several folders and with a moved cargo home, on macOS arm64
+only.
+
+## What is here
+
+| Path | Content |
+|---|---|
+| `drozo.py` | the model description read by SolTensor |
+| `data/core_v1/` | the circuit: neurons, signed connections, sources, drives, readouts |
+| `data/calibration.json` | compute-unit weights of the program's steps |
+| `shell/` | the hand-written Rust around the brain: accounts, fees, body, records; `build_pins.json` makes the build give the same bytes from any folder |
+| `reference/core_ref.py` | the reference simulator the circuit was validated with |
+| `tests/fixtures/` | 5 recorded cases: state before, stimulus, state after |
 
 Private for now.
