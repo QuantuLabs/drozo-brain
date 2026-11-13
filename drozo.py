@@ -15,5 +15,5 @@ model = sn.network(
     expect=sn.exact(
         arch="v0",
         image_sha256="824490e29a1d006909d58434b69ae07a8d5afa76600327de6658c224c626566d",
-        elf_sha256="a98f6b207946e39b54972a5228590f50ccc911a070d09e411a8e1c53367df65d"),
+        elf_sha256="1f5abfaa937845f566962eb797f46fb874c959cf57bcf2b6888b494005547862"),
 )

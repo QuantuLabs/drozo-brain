@@ -47,7 +47,7 @@ pub fn dispatch(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> Pr
     let shape = match ix[0] {
         OP_MODEL_WRITE | OP_MAP_WRITE => n == 1 && l >= 5,
         OP_MODEL_SEAL | OP_MAP_SEAL => n == 1 && l == 1,
-        OP_INIT => n == 6 && l == 74,
+        OP_INIT => n == 8 && l == 82,
         OP_NEXT_ACTION => n == 7 && l == 24,
         OP_ADVANCE_UNTIL => n == 2 && l == 9,
         OP_SEAL => n == 1 && l == 3,
@@ -151,7 +151,8 @@ fn bump(d: &mut [u8]) -> Result<u32, ProgramError> {
 
 const SYSTEM: [u8; 32] = [0; 32];
 /// Fee-shares program, its pool config ["cfg", admin0, id], the shards ["vault", config, [i]] receiving the fee
-/// (selected by fly[0] & 7), FEE_CAP (= the pool's fee_max) and the RECLAIM kind-0 targets (our model and stock map).
+/// (selected by fly[0] & 7), FEE_CAP (= the pool's fee_max), the RECLAIM kind-0 targets (our model and stock map),
+/// the creation fee's TREASURY, its price config ["cfg", admin0, TREASURY] and CREATE_FEE_CAP (= that config's fee_max).
 // BEGIN tools/fee_vaults.py (profile devnet): generated, do not edit
 const FEE_PROGRAM: [u8; 32] = [177, 68, 243, 67, 115, 133, 0, 245, 142, 84, 3, 243, 126, 103, 159, 30, 148, 129, 16, 248, 165, 235, 205, 116, 42, 182, 134, 49, 230, 53, 242, 122];
 const FEE_CONFIG: [u8; 32] = [226, 30, 120, 6, 100, 247, 10, 172, 47, 46, 119, 174, 43, 64, 161, 16, 107, 254, 215, 225, 253, 109, 169, 218, 165, 139, 57, 230, 36, 230, 55, 103];
@@ -168,6 +169,9 @@ const FEE_VAULTS: [[u8; 32]; 8] = [
 ];
 const MODEL_KEY: [u8; 32] = [102, 235, 85, 164, 88, 125, 145, 173, 117, 93, 4, 40, 213, 166, 35, 26, 252, 195, 94, 207, 159, 122, 60, 226, 133, 246, 204, 192, 201, 186, 253, 71];
 const MAP_KEY: [u8; 32] = [13, 89, 129, 194, 207, 144, 169, 112, 157, 51, 151, 217, 215, 148, 196, 110, 189, 129, 153, 102, 75, 104, 215, 29, 168, 120, 89, 218, 225, 198, 26, 217];
+const TREASURY: [u8; 32] = [193, 201, 197, 173, 15, 176, 42, 7, 185, 129, 103, 7, 36, 145, 167, 106, 35, 213, 66, 17, 186, 23, 218, 250, 158, 145, 45, 54, 168, 150, 161, 125];
+const CREATE_CONFIG: [u8; 32] = [129, 36, 15, 200, 205, 124, 187, 140, 219, 83, 202, 81, 175, 53, 22, 215, 59, 23, 171, 219, 84, 211, 200, 76, 106, 54, 139, 22, 132, 254, 233, 164];
+const CREATE_FEE_CAP: u64 = 100_000_000;
 // END tools/fee_vaults.py
 const _: () = {
     let mut i = 0;
@@ -434,16 +438,29 @@ fn reclaim(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> Program
     Ok(())
 }
 
-/// INIT [4, name_len, name 32, delegate 32, expiry u64] (fly w = PDA ["fly", asset], owner s,
-/// asset ro, payer ws, System program ro, map ro), in three steps selected by the fly length (§5.2).
+/// INIT [4, name_len, name 32, delegate 32, expiry u64, max_fee u64] (fly w = PDA ["fly", asset], owner s,
+/// asset ro, payer ws, System program ro, map ro, TREASURY w, CREATE_CONFIG ro), in three steps selected by the
+/// fly length (§5.2); the last one moves the price config's fee (<= CREATE_FEE_CAP, <= max_fee) to TREASURY.
 fn init(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> ProgramResult {
     let (fly, owner, asset, payer, system, map) = (&accounts[0], &accounts[1], &accounts[2], &accounts[3], &accounts[4], &accounts[5]);
+    let (treasury, config) = (&accounts[6], &accounts[7]);
     let pl = &ix[1..74];
     let agent = *asset.address().as_array();
     let pk = *payer.address().as_array();
     let fk = *fly.address().as_array();
     let mk = map.address().as_array();
-    if pk == agent || pk == fk || fk == agent || *system.address().as_array() != SYSTEM || system.is_writable() || map.is_writable() {
+    if pk == agent
+        || pk == fk
+        || fk == agent
+        || *system.address().as_array() != SYSTEM
+        || system.is_writable()
+        || map.is_writable()
+        || *treasury.address().as_array() != TREASURY
+        || !treasury.is_writable()
+        || pk == TREASURY
+        || *config.address().as_array() != CREATE_CONFIG
+        || config.is_writable()
+    {
         return Err(invalid());
     }
     if !payer.is_signer() {
@@ -514,6 +531,19 @@ fn init(program_id: &Address, accounts: &[AccountView], ix: &[u8]) -> ProgramRes
     };
     if len == STEP {
         return fly.resize(2 * STEP);
+    }
+    let (_, fee) = fee_config(config)?;
+    if fee > CREATE_FEE_CAP {
+        return Err(invalid());
+    }
+    if fee > u64_at(ix, 74) {
+        return Err(fee_above_max());
+    }
+    if fee != 0 {
+        if payer.lamports() < fee {
+            return Err(fee_unpaid());
+        }
+        pinocchio_system::instructions::Transfer { from: payer, to: treasury, lamports: fee }.invoke()?;
     }
     fly.resize(V5_LEN)?;
     let mut d = fly.try_borrow_mut()?;

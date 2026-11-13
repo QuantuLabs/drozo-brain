@@ -36,13 +36,13 @@ soltensor analyze      # sizes and host checks
 soltensor build        # target/drozo.so and target/drozo.model.bin
 soltensor test         # host reference on the 5 recorded cases
 shasum -a 256 target/drozo.so
-# a98f6b207946e39b54972a5228590f50ccc911a070d09e411a8e1c53367df65d  target/drozo.so
+# 1f5abfaa937845f566962eb797f46fb874c959cf57bcf2b6888b494005547862  target/drozo.so
 ```
 
-`build` produces the program Drozo runs on devnet, byte for byte (115,344 bytes, SBPF v0), and
+`build` produces the program Drozo runs on devnet, byte for byte (118,216 bytes, SBPF v0), and
 refuses anything else. It needs no wallet, validator or network. The whole inference runs on-chain:
 SolTensor only prepares the model image, the certificate tables, the constants and the Rust brain
-code. Deploying the program and driving flies belongs to the Drozo app.
+code. Deploying the program and driving flies belongs to the Drozo app. When a fly is created, the program takes the creation fee itself and sends it to the treasury.
 
 The identical binary was checked from several folders and with a moved cargo home, on macOS arm64
 only.
