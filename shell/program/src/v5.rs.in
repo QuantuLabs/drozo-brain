@@ -153,7 +153,7 @@ const SYSTEM: [u8; 32] = [0; 32];
 /// Fee-shares program, its pool config ["cfg", admin0, id], the shards ["vault", config, [i]] receiving the fee
 /// (selected by fly[0] & 7), FEE_CAP (= the pool's fee_max), the RECLAIM kind-0 targets (our model and stock map),
 /// the creation fee's TREASURY, its price config ["cfg", admin0, TREASURY] and CREATE_FEE_CAP (= that config's fee_max).
-// BEGIN tools/fee_vaults.py (profile devnet): generated, do not edit
+// BEGIN tools/fee_vaults.py (profile @@PROFILE_name@@): generated, do not edit
 const FEE_PROGRAM: [u8; 32] = [177, 68, 243, 67, 115, 133, 0, 245, 142, 84, 3, 243, 126, 103, 159, 30, 148, 129, 16, 248, 165, 235, 205, 116, 42, 182, 134, 49, 230, 53, 242, 122];
 const FEE_CONFIG: [u8; 32] = [226, 30, 120, 6, 100, 247, 10, 172, 47, 46, 119, 174, 43, 64, 161, 16, 107, 254, 215, 225, 253, 109, 169, 218, 165, 139, 57, 230, 36, 230, 55, 103];
 const FEE_CAP: u64 = 20_000_000;
@@ -167,8 +167,8 @@ const FEE_VAULTS: [[u8; 32]; 8] = [
     [124, 193, 50, 237, 72, 81, 14, 83, 185, 69, 221, 98, 62, 112, 159, 95, 246, 219, 121, 61, 248, 248, 235, 224, 137, 237, 192, 221, 41, 93, 57, 157],
     [104, 216, 90, 151, 0, 174, 31, 69, 125, 35, 121, 170, 252, 63, 181, 2, 24, 153, 15, 64, 246, 51, 189, 203, 37, 216, 152, 177, 76, 200, 37, 212],
 ];
-const MODEL_KEY: [u8; 32] = [102, 235, 85, 164, 88, 125, 145, 173, 117, 93, 4, 40, 213, 166, 35, 26, 252, 195, 94, 207, 159, 122, 60, 226, 133, 246, 204, 192, 201, 186, 253, 71];
-const MAP_KEY: [u8; 32] = [13, 89, 129, 194, 207, 144, 169, 112, 157, 51, 151, 217, 215, 148, 196, 110, 189, 129, 153, 102, 75, 104, 215, 29, 168, 120, 89, 218, 225, 198, 26, 217];
+const MODEL_KEY: [u8; 32] = @@PROFILE_model@@;
+const MAP_KEY: [u8; 32] = @@PROFILE_map@@;
 const TREASURY: [u8; 32] = [193, 201, 197, 173, 15, 176, 42, 7, 185, 129, 103, 7, 36, 145, 167, 106, 35, 213, 66, 17, 186, 23, 218, 250, 158, 145, 45, 54, 168, 150, 161, 125];
 const CREATE_CONFIG: [u8; 32] = [129, 36, 15, 200, 205, 124, 187, 140, 219, 83, 202, 81, 175, 53, 22, 215, 59, 23, 171, 219, 84, 211, 200, 76, 106, 54, 139, 22, 132, 254, 233, 164];
 const CREATE_FEE_CAP: u64 = 100_000_000;

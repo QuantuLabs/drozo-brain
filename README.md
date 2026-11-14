@@ -39,6 +39,10 @@ shasum -a 256 target/drozo.so
 # 1f5abfaa937845f566962eb797f46fb874c959cf57bcf2b6888b494005547862  target/drozo.so
 ```
 
+Two profiles share the model and the shell; they differ only by `shell/fee_keys.<profile>.json` and the pin:
+- devnet (default): `soltensor build` → `target/drozo.so`, sha256 `1f5abfaa…7862`, 118,216 bytes.
+- mainnet: `soltensor build mainnet/drozo_mainnet.py` → `target/drozo_mainnet.so`, sha256 `0fdf09ab5d0bc8a5fb39c3a96fe6c7f4e74054f64f9b595464185f2ac64947be`, 118,216 bytes.
+
 `build` produces the program Drozo runs on devnet, byte for byte (118,216 bytes, SBPF v0), and
 refuses anything else. It needs no wallet, validator or network. The whole inference runs on-chain:
 SolTensor only prepares the model image, the certificate tables, the constants and the Rust brain
@@ -52,6 +56,7 @@ only.
 | Path | Content |
 |---|---|
 | `drozo.py` | the model description read by SolTensor |
+| `mainnet/drozo_mainnet.py` | the same model with the mainnet profile and pin |
 | `data/core_v1/` | the circuit: neurons, signed connections, sources, drives, readouts |
 | `data/calibration.json` | compute-unit weights of the program's steps |
 | `shell/` | the hand-written Rust around the brain: accounts, fees, body, records; `build_pins.json` makes the build give the same bytes from any folder |
