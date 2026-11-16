@@ -2,5 +2,5 @@
   "name": "mainnet",
   "model": "4yeC998yFG3z8sDtskeoWYx9QeZyNVmb2LCD2TD36MXa",
   "map": "28N8S6NPDoX8mcMNpwv2aonPP9LZLN1CTugvumfgZo97",
-  "provenance": "mainnet D0 model/map pubkeys (orchestrator 2026-10-31; = MODEL_KEY/MAP_KEY of the kernel block at 9caba74); deploy binds <run>/keys/model.json and map.json to these"
+  "provenance": "model and map account addresses for mainnet; the deploy creates the two accounts at these addresses"
 }

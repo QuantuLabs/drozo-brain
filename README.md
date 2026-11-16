@@ -17,8 +17,15 @@ The brain of Drozo, as a SolTensor model: a real fruit-fly circuit that the gene
 The circuit comes from the MaleCNS connectome, a map of the full central nervous system of a male *Drosophila melanogaster*: 165,122 neurons.
 
 1. The full connectome runs as an integer leaky integrate-and-fire network (the *teacher*).
-2. Only about 2,800 of its neurons ever fire. The core is the union of the training probes and every neuron that fired across a 36,000-event exploration of the teacher.
-3. The core runs with the teacher's arithmetic and weights, unchanged. It matched the teacher on 306/306 outputs.
+2. The teacher was simulated on 36,000 stimuli (636 journeys of five kinds: sugar, water, bitter, touch, looming
+   shadow), on top of a 115-event training corpus. Every neuron that fired at least once was kept: 2,839 neurons,
+   1.7 % of the connectome. In the last 15,000 stimuli a single new neuron appeared.
+3. The core runs with the teacher's arithmetic and weights, unchanged. A neuron that never fires sends nothing, so
+   removing it changes no spike. On the five recorded cases in `tests/fixtures`, the core was identical to the full
+   teacher at every step.
+
+The selection is empirical, not a proof: a stimulus sequence outside the explored set could make a removed neuron
+fire.
 
 No weight is learned. A connection's weight is its real synapse count, signed by the source neuron and scaled by two global constants:
 
