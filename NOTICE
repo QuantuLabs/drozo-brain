@@ -1,0 +1,6 @@
+Drozo model
+Copyright 2026 QuantuLabs
+
+The circuit in data/core_v1 is derived from the MaleCNS v1.0 connectome
+(Janelia FlyEM, Janelia Research Campus). The connectome data stays under
+the dataset's own terms; see DATA.md.

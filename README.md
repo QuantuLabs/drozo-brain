@@ -5,8 +5,9 @@ The brain of Drozo, as a SolTensor model: a real fruit-fly circuit that the gene
 | | |
 |---|---|
 | Neurons | 2,839 |
-| Weighted connections | 204,153 |
-| Synapses behind them | 2,588,357 |
+| Connections | 204,153 |
+| Synapses carried by the on-chain weights | 2,533,893 |
+| Synapses in the source data for these connections | 2,588,357 |
 | Sensory inputs | 500 neurons, 5 senses × 100 |
 | Motor outputs | 72 neurons in 6 readout groups |
 | Trained parameters | 0 |
@@ -26,10 +27,15 @@ edge_delta = R16(src_sign * edge_syn * w_syn_q16 * gain_q16)
 R16(v) = v / 2^16, rounded half away from zero
 ```
 
+Each connection's weight therefore gives its synapse count back exactly. 192,983 connections have a non-zero
+weight, for 2,533,893 synapses. The other 11,170 connections leave 203 neurons whose sign is 0: their weight is 0, so
+their 54,464 synapses have no effect and cannot be read back from the chain.
+
 ## Build
 
 With [SolTensor](https://github.com/QuantuLabs/soltensor) installed (its README lists the Solana
-tools: `cargo-build-sbf` 4.1.0 and platform-tools v1.54):
+tools: `cargo-build-sbf` 4.1.0 and platform-tools v1.54). SolTensor is released separately, after this
+repository:
 
 ```bash
 soltensor analyze      # sizes and host checks
@@ -63,4 +69,8 @@ only.
 | `reference/core_ref.py` | the reference simulator the circuit was validated with |
 | `tests/fixtures/` | 5 recorded cases: state before, stimulus, state after |
 
-Private for now.
+## Data and license
+
+The code is released under the [Apache-2.0](LICENSE) license. Copyright 2026 QuantuLabs; see [NOTICE](NOTICE).
+The circuit is derived from the MaleCNS v1.0 connectome (Janelia FlyEM); see [DATA.md](DATA.md) for the credit
+and terms.
