@@ -1,4 +1,4 @@
-# Drozo model
+# Drozo brain
 
 The brain of Drozo: 2,839 neurons of a real fruit fly, wired exactly as its connectome records them, running entirely on Solana.
 
