@@ -4,13 +4,13 @@ The brain of Drozo: 2,839 neurons of a real fruit fly, wired exactly as its conn
 
 Every spike is computed by a Solana program, in integers. No weight is trained and no server thinks for the fly. Anyone can rebuild the program to the same bytes and replay a brain to the same state.
 
-It is written as a [SolTensor](https://github.com/QuantuLabs/soltensor) model: the generic SolTensor compiler turns this description into the on-chain program.
+It is written as a SolTensor model (SolTensor: coming soon): the generic SolTensor compiler turns this description into the onchain program.
 
 | | |
 |---|---|
 | Neurons | 2,839, of 1,183 cell types |
 | Connections | 204,153: every connection the connectome records between these neurons |
-| Synapses carried by the on-chain weights | 2,533,893 |
+| Synapses carried by the onchain weights | 2,533,893 |
 | Synapses in the source data for these connections | 2,588,357 |
 | Sensory inputs | 500 neurons, 5 senses × 100 |
 | Motor outputs | 72 neurons in 6 readout groups |
@@ -19,7 +19,7 @@ It is written as a [SolTensor](https://github.com/QuantuLabs/soltensor) model: t
 
 ## The wiring is the connectome's
 
-The circuit comes from MaleCNS v1.0, the map of the full central nervous system of a male *Drosophila melanogaster*: 165,122 neurons.
+The circuit comes from [MaleCNS v1.0](https://www.janelia.org/project-team/flyem/male-cns-connectome) (Janelia FlyEM), the map of the full central nervous system of a male *Drosophila melanogaster*: 165,122 neurons.
 
 The 2,839 neurons span the brain and the nerve cord: 969 brain interneurons, 744 nerve-cord interneurons, 403 sensory neurons, 242 ascending and 155 descending neurons that link brain and cord, 157 motor neurons, 109 visual projection neurons and 60 others. `data/neurons.csv` gives the MaleCNS body id, cell type and class of each one, so any neuron can be looked up in the dataset.
 
@@ -59,7 +59,7 @@ The brain answers through 72 motor and efferent neurons, the ones the inputs rea
 
 ## A known reflex comes out of the wiring
 
-LPLC2 neurons detect an approaching object and excite the giant fibres, which trigger the escape jump (Klapoetke et al., *Nature* 2017, doi:10.1038/nature24626). That pathway is in the model: the LPLC2 neurons reach the two giant fibres through 100 connections (2,795 synapses), and the giant fibres reach the two TTMn, the motor neurons of the jump muscle, through 2 connections (90 synapses).
+LPLC2 neurons detect an approaching object and excite the giant fibres, which trigger the escape jump (Klapoetke et al., *Nature* 2017, [doi:10.1038/nature24626](https://doi.org/10.1038/nature24626)). That pathway is in the model: the LPLC2 neurons reach the two giant fibres through 100 connections (2,795 synapses), and the giant fibres reach the two TTMn, the motor neurons of the jump muscle, through 2 connections (90 synapses).
 
 Start a brain at rest and play each stimulus once:
 
@@ -74,7 +74,7 @@ looming   2189 spikes from  892 neurons | giant fibre first spike at step [40, 4
 
 The looming shadow fires both giant fibres, then both jump motor neurons. The four other stimuli fire neither. No weight was set for this: the two global constants scale all 204,153 connections alike.
 
-## Every spike is computed on-chain
+## Every spike is computed onchain
 
 - Neurons are integer leaky integrate-and-fire units. One stimulus is 400 brain steps, with a synaptic delay of 4 steps and a refractory period of 5.
 - Each fly has its own brain: the state of all its neurons lives in that fly's account, and each transaction advances it by a bounded number of steps.
@@ -103,9 +103,8 @@ The looming shadow fires both giant fibres, then both jump motor neurons. The fo
 
 ## Build
 
-With [SolTensor](https://github.com/QuantuLabs/soltensor) installed (its README lists the Solana
-tools: `cargo-build-sbf` 4.1.0 and platform-tools v1.54). SolTensor is released separately, after this
-repository:
+With SolTensor installed (coming soon: it is released separately, after this repository; it needs
+the Solana tools `cargo-build-sbf` 4.1.0 and platform-tools v1.54):
 
 ```bash
 soltensor analyze      # sizes and host checks
@@ -120,7 +119,7 @@ Two profiles share the model and the shell; they differ only by `shell/fee_keys.
 - mainnet: `soltensor build mainnet/drozo_mainnet.py` → `target/drozo_mainnet.so`, sha256 `0fdf09ab5d0bc8a5fb39c3a96fe6c7f4e74054f64f9b595464185f2ac64947be`, 118,216 bytes.
 
 `build` produces the program Drozo runs on devnet, byte for byte (118,216 bytes, SBPF v0), and
-refuses anything else. It needs no wallet, validator or network. The whole inference runs on-chain:
+refuses anything else. It needs no wallet, validator or network. The whole inference runs onchain:
 SolTensor only prepares the model image, the certificate tables, the constants and the Rust brain
 code. Deploying the program and driving flies belongs to the Drozo app. When a fly is created, the program takes the creation fee itself and sends it to the treasury.
 
@@ -141,6 +140,15 @@ only.
 | `reference/reflex.py` | plays each stimulus on a brain at rest and prints what fires |
 | `reference/wiring.py` | compares the model's connections with the MaleCNS file |
 | `tests/fixtures/` | 5 recorded cases: state before, stimulus, state after |
+
+## References and credits
+
+The neurons, their types and their connections are the work of the MaleCNS team. Go to the original:
+
+- Dataset: [MaleCNS v1.0](https://www.janelia.org/project-team/flyem/male-cns-connectome), Janelia FlyEM, Janelia Research Campus. The page links to the data and to the tools to explore it.
+- Paper: Berg et al., "Sexual dimorphism in the complete connectome of the Drosophila male central nervous system", bioRxiv 2025, [doi:10.1101/2025.10.09.680999](https://doi.org/10.1101/2025.10.09.680999).
+- Escape circuit: Klapoetke et al., "Ultra-selective looming detection from radial motion opponency", *Nature* 2017, [doi:10.1038/nature24626](https://doi.org/10.1038/nature24626).
+- Data license: [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Attribution: "MaleCNS v1.0, Janelia Research Campus (CC-BY)".
 
 ## Data and license
 
